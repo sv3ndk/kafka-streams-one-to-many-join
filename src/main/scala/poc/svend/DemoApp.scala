@@ -22,11 +22,11 @@ object DemoApp extends App {
     val p = new Properties()
     p.put(StreamsConfig.APPLICATION_ID_CONFIG, "one-to-many-join-demo")
     p.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092")
+    p.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, "250")
     p
   }
 
   val builder: StreamsBuilder = new StreamsBuilder
-
   val streams: KafkaStreams = new KafkaStreams(Demo.buildTopology(builder), props)
 
   // ugly hack: cleaning up all states at every start to make the demo easier to restart
@@ -35,7 +35,7 @@ object DemoApp extends App {
   streams.start()
 
   sys.ShutdownHookThread {
-    streams.close(Duration.ofSeconds(10))
+    streams.close(Duration.ofSeconds(2))
   }
 }
 
@@ -140,12 +140,10 @@ object InterModel {
     */
   case class CarMoveEvent(carId: Int, zoneId: Int, isArriving: Boolean, fuelLevel: Double)
 
-
   object JsonSerdes {
     implicit val carMoveSerdes: JsonSerdes[CarMove] = new JsonSerdes(false)(Json.reads[CarMove], Json.writes[CarMove])
     implicit val carEventSerdes: JsonSerdes[CarMoveEvent] = new JsonSerdes(false)(Json.reads[CarMoveEvent], Json.writes[CarMoveEvent])
   }
-
 
 }
 
@@ -205,7 +203,7 @@ object CarEventLeftJoinZone extends ValueTransformerWithKeySupplier[Int, CarMove
         // if we know the pollution level of that zone: emit a join result
         Option(zoneEventStore.get(carEvent.zoneId))
           .map { zoneEvent =>
-            logger.info("found a mathing zone event to this car event!")
+//            logger.info("found a matching zone event to this car event!")
 
             JoinedCarPollutionEvent(carEvent.carId, carEvent.zoneId, carEvent.fuelLevel, zoneEvent.pollution_level)
           }.orElse {
@@ -232,7 +230,7 @@ object CarEventLeftJoinZone extends ValueTransformerWithKeySupplier[Int, CarMove
 
 
 /**
-  * Transformer responsible for joining zone events moves to all the car present in the car state store.
+  * Transformer responsible for joining zone events to all the cars currently present in that zone..
   *
   * => any time a new zone event is received, we re-emit all the joined event for all the cars known to be
   * in that zone.
@@ -267,7 +265,7 @@ object ZoneEventLeftJoinCar extends TransformerSupplier[Int, ZoneEvent, KeyValue
 
     override def transform(key: Int, zoneEvent: ZoneEvent): KeyValue[Int, JoinedCarPollutionEvent] = {
 
-      logger.info(s"zone event for  zone $key")
+//      logger.info(s"zone event for  zone $key")
 
       zoneEventStore.put(zoneEvent.zone_id, zoneEvent)
 
@@ -291,4 +289,3 @@ object ZoneEventLeftJoinCar extends TransformerSupplier[Int, ZoneEvent, KeyValue
 
 
 }
-
