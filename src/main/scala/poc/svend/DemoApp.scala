@@ -44,17 +44,23 @@ object DemoApp extends App {
   * The purpose of this demo is to join 2 streams of events, one with the current position of a car (car arrival events)
   * and one with the pollution level in various zones (zone events).
   *
-  * The semantic of the join is that of a one-to-many table-to-table join by foreign key, commonly found in
-  * traditional DB systems.
+  * Car arrival event: (car_id: Int, to_zone_id: Int, fuel_level: Double)
+  * Zone pollution level event: (zone_id: Int, pollution_level: Double)
+  *
+  * The semantic of the join is that of a one-to-many table-to-table join by foreign key (the zone id in the case), as
+  * commonly found in traditional DB systems.
   *
   * The result is a stream of "car pollution events", showing the pollution level to which each car is currently exposed.
   *
-  * The catch is that we want the join to be updated any time a new car event or zone event is received. This means we
-  * can't implement this with a typical stream-to-table join, since those are not updated when the table is updated, and
-  * we can't implement this with a ktable-to-ktable join either, since those are only possible for equi-joint (in the
-  * current version of Kafka Streams, i.e. 2.2).
+  * Joined result: (car_id: Int, zone_id: Int, fuel_level: Double, pollution_level: Double)
   *
-  * Time semantics have not been taken into account => events are processed in the order of arrival.
+  * The catch is that we want the join to be updated any time a new car event or zone event is received. This means we
+  * can't implement this with the Kafka Streams built-in stream-to-table join, since those are not updated when the
+  * table is updated, and we can't implement this with a ktable-to-ktable join either, since those are only possible for
+  * equi-joint (in the current version of Kafka Streams, i.e. 2.2).
+  *
+  * To keep things simple, time semantics have not been taken into account in this demo => there are no timestamp
+  * anywhere and events are processed in the order of arrival.
   *
   */
 object Demo {
@@ -69,9 +75,13 @@ object Demo {
     builder.addStateStore(CarEventLeftJoinZone.carArrivalEventStoreBuilder)
     builder.addStateStore(ZoneEventLeftJoinCar.zoneEventStoreBuilder)
 
+    // note that the streams below are co-partitioned (by zoneId) before the join (i.e. before CarEventLeftJoinZone and
+    // ZoneEventLeftJoinCar)
+
     val carJoinedToZones = builder
 
-      // transforms car arrival events into car "leaving" and car "arriving" events
+      // transforms car arrival events into car "leaving" and car "arriving" events. This is required to remove cars
+      // from their previous location in the state store
       .stream[Int, CarArrivalEvent]("car-events")
       .groupByKey.aggregate(InterModel.noPrevMov)(carMoveHandler)
       .toStream
@@ -79,7 +89,7 @@ object Demo {
       .selectKey((carId, car) => car.zoneId)
       .through("car-move-events-partitioned-by-zone")
 
-      // looking up zones for each car-event
+      // for each car-event, looks up the zone event to obtain the latest pollution level
       .transformValues(CarEventLeftJoinZone,
       CarEventLeftJoinZone.carArrivalEventStoreBuilder.name, ZoneEventLeftJoinCar.zoneEventStoreBuilder.name)
       .filter { case (zoneId, joinedEvent) => joinedEvent != null }
@@ -87,7 +97,7 @@ object Demo {
     val zonesJoinedToCars = builder
       .stream[Int, ZoneEvent]("zone-events")
 
-      // looking up all cars for each zone-event
+      // for each zone-event, looks up all cars in that region and re-emit their pollution level
       .transform(ZoneEventLeftJoinCar,
       CarEventLeftJoinZone.carArrivalEventStoreBuilder.name, ZoneEventLeftJoinCar.zoneEventStoreBuilder.name)
       .filter { case (zoneId, joinedEvent) => joinedEvent != null }
@@ -100,8 +110,8 @@ object Demo {
   }
 
   /**
-    * Combines a new car event together with an optional previous move to deduct the new (from, to) movement of
-    * that car
+    * Combines a new car event together with an optional previous move of the same car to deduct the new (from, to)
+    * movement of that car
     **/
   def carMoveHandler(carId: Int, carEvent: CarArrivalEvent, preMove: CarMove): CarMove =
     CarMove(
@@ -109,7 +119,7 @@ object Demo {
       carEvent.to_zone_id, carEvent.car_id, carEvent.fuel_level)
 
   /**
-    * Transform a car move event into up to 2 car events: one leaving the previous zone (if any) and one arriving to
+    * Transforms a car move event into up to 2 car events: one leaving the previous zone (if any) and one arriving to
     * the new zone
     */
   def carMoveToCarEvents(carMove: CarMove): Seq[CarMoveEvent] = {
@@ -119,7 +129,6 @@ object Demo {
     arrivingEvent +: leavingEvent.toSeq
   }
 
-
 }
 
 /**
@@ -128,11 +137,12 @@ object Demo {
 object InterModel {
 
   /**
-    * car move, together with the previous zone-id of that car
+    * movement of a car from a zone id to a zone id
     */
   case class CarMove(fromZone: Option[Int], toZone: Int, carId: Int, fuelLevel: Double)
 
-  // special marker used as 1rst value in the aggregate (a bit ugly, a better way would be to tune the serializer...)
+  // special marker used as 1rst value in the aggregate when there are no previously known position for a car
+  // (a bit ugly, a better way would be to tune the serializer...)
   val noPrevMov = CarMove(None, -1, -1, -1d)
 
   /**
@@ -156,7 +166,7 @@ object CarEventLeftJoinZone extends ValueTransformerWithKeySupplier[Int, CarMove
   override def get(): ValueTransformerWithKey[Int, CarMoveEvent, JoinedCarPollutionEvent] = new CarEventProcessor()
 
   /**
-    * composite key for the car event state store,
+    * composite key for the car arrival event state store,
     */
   case class ZoneCarId(zoneId: Int, carId: Int)
 
@@ -165,8 +175,9 @@ object CarEventLeftJoinZone extends ValueTransformerWithKeySupplier[Int, CarMove
   }
 
   /**
-    * store for all car event, keyed by (zone id, car id)
-    * => this will enable efficient range scans during the join
+    * store for all car arrival events, keyed by (zone id, car id)
+    * => this will enable efficient range scans for a whole zone during the join triggered by a zone update (in
+    * ZoneEventLeftJoinCar)
     **/
   val carArrivalEventStoreBuilder = Stores.keyValueStoreBuilder(
     Stores.persistentKeyValueStore("car-arrival-events-store"),
@@ -203,8 +214,7 @@ object CarEventLeftJoinZone extends ValueTransformerWithKeySupplier[Int, CarMove
         // if we know the pollution level of that zone: emit a join result
         Option(zoneEventStore.get(carEvent.zoneId))
           .map { zoneEvent =>
-//            logger.info("found a matching zone event to this car event!")
-
+            // logger.info("found a matching zone event to this car event!")
             JoinedCarPollutionEvent(carEvent.carId, carEvent.zoneId, carEvent.fuelLevel, zoneEvent.pollution_level)
           }.orElse {
           None
@@ -212,7 +222,7 @@ object CarEventLeftJoinZone extends ValueTransformerWithKeySupplier[Int, CarMove
         }
 
       } else {
-        // removes that car from that zone
+        // car is leaving => simply removes that car from that previous zone
         carArrivalEventStore.delete(ZoneCarId(carEvent.zoneId, carEvent.carId))
 
         // not emitting any joined result for "leaving" car events
@@ -225,14 +235,13 @@ object CarEventLeftJoinZone extends ValueTransformerWithKeySupplier[Int, CarMove
 
     override def close(): Unit = {}
   }
-
 }
 
 
 /**
   * Transformer responsible for joining zone events to all the cars currently present in that zone..
   *
-  * => any time a new zone event is received, we re-emit all the joined event for all the cars known to be
+  * => any time a new zone event is received, we re-emit all the joined results for all the cars known to be
   * in that zone.
   **/
 object ZoneEventLeftJoinCar extends TransformerSupplier[Int, ZoneEvent, KeyValue[Int, JoinedCarPollutionEvent]] {
@@ -265,7 +274,7 @@ object ZoneEventLeftJoinCar extends TransformerSupplier[Int, ZoneEvent, KeyValue
 
     override def transform(key: Int, zoneEvent: ZoneEvent): KeyValue[Int, JoinedCarPollutionEvent] = {
 
-//      logger.info(s"zone event for  zone $key")
+      //      logger.info(s"zone event for  zone $key")
 
       zoneEventStore.put(zoneEvent.zone_id, zoneEvent)
 
@@ -286,6 +295,5 @@ object ZoneEventLeftJoinCar extends TransformerSupplier[Int, ZoneEvent, KeyValue
 
     override def close(): Unit = {}
   }
-
 
 }
